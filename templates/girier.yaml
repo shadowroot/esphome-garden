@@ -1,0 +1,278 @@
+substitutions:
+  devicename: girier
+  friendly_name: girier
+  device_description: girier
+  current_res: "0.00221" # Random value. Requires power monitoring calibration
+  voltage_div: "955" # Random value. Requires power monitoring calibration
+
+esphome:
+  name: ${devicename}
+  comment: ${device_description}
+  #platform: ESP8266
+  #board: esp01_1m
+
+esp8266:
+  board: esp8285
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: ${friendly_name}
+    password: !secret AP_Password
+
+  manual_ip:
+      static_ip: 192.168.5.101
+      gateway: 192.168.5.1
+      subnet: 255.255.255.0
+
+captive_portal:
+
+# Enable logging
+logger:
+
+# Web server can be removed after enabling HA API
+web_server:
+  port: 80
+
+# Enable Home Assistant API
+api:
+  password: !secret OTA_Password
+
+ota:
+  password: !secret OTA_Password
+
+# Enable time component for use by daily power sensor
+time:
+  - platform: homeassistant
+    id: homeassistant_time
+
+sensor:
+# Reports how long the device has been powered (in minutes)
+  - platform: uptime
+    name: ${friendly_name} Uptime
+    filters:
+      - lambda: return x / 60.0;
+    unit_of_measurement: minutes
+
+# Reports the WiFi signal strength
+  - platform: wifi_signal
+    name: ${friendly_name} Wifi Signal
+    update_interval: 60s
+
+
+  # Reports the Current, Voltage, and Power used by the plugged-in device (not counting this plug's own usage of about 0.8W/0.019A, so subtract those when calibrating with this plugged into a Kill-A-Watt type meter)
+  - platform: hlw8012
+    model: BL0937
+    sel_pin:
+      number: GPIO3
+      inverted: true
+    cf_pin: GPIO4
+    cf1_pin: GPIO5
+    current_resistor: 0.001 #The value of the shunt resistor for current measurement. Defaults to the Sonoff POW’s value 0.001 ohm. Verified on https://fccid.io/2ANOO-SM800/Internal-Photos/Internal-Photos-3601477 that we use "R001" = 0.001 ohm
+    voltage_divider: 2401 #The value of the voltage divider on the board as (R_upstream + R_downstream) / R_downstream. Defaults to the Sonoff POW’s value 2351. From the pic we use 2x "125" = 2x 1.2Mohm for R_upstream and "102" = 1kohm for R_downstream, so (1,200,000+1,200,000+1,000)/1,000 = 2401
+    # but those don't fix the measurement values, probably because we actually have a BL0937 chip instead of a HLW8012, (and part variance aswell) so we have to manually calibrate with a known load or a load and a Kill-A-Watt type meter. My values used below will only be +/-10% of yours I think.
+    power:
+      name: ${friendly_name} Power
+      unit_of_measurement: W
+      id: wattage
+      filters:
+        - calibrate_linear:
+            # Map 0.0 (from sensor) to 0.0 (true value)
+            - 0.0 -> 0.0 #Need to keep 0 mapped to 0 for when connected device is not drawing any power
+            - 4054.3 -> 721.2 #Tested using a meter and 722.0W toaster -0.8W from just this plug with toaster off
+      on_value:
+        then:
+          - mqtt.publish:
+              topic: greenhouse_relay/power
+              payload: |-
+                id("${friendly_name} Power").state
+    current:
+      name: ${friendly_name} Current
+      unit_of_measurement: A
+      filters:
+        - calibrate_linear:
+            # Map 0.0 (from sensor) to 0.0 (true value)
+            - 0.0 -> 0.0 #Need to keep 0 mapped to 0 for when connected device is not drawing any power
+            - 7.4 -> 6.103 #Tested using a meter and 6.122A toaster -0.019A from just this plug with toaster off
+      on_value:
+        then:
+          - mqtt.publish:
+              topic: greenhouse_relay/current
+              payload: |-
+                id("${friendly_name} Current").state
+    voltage:
+      name: ${friendly_name} Voltage
+      unit_of_measurement: V
+      filters:
+        - calibrate_linear:
+            # Map 0.0 (from sensor) to 0.0 (true value)
+            #- 0.0 -> 0.0 #Don't care if 0 reading aligns with 0 real Volts since we won't ever measure that
+            - 294.7 -> 117.8 #Tested using a meter, value while connected toaster was on
+            - 321.7 -> 121.6 #value while connected toaster was off
+      on_value:
+        then:
+          - mqtt.publish:
+              topic: greenhouse_relay/voltage
+              payload: |-
+                id("${friendly_name} Voltage").state
+    change_mode_every: 1 #Skips first reading after each change, so this will double the update interval. Default 8
+    update_interval: 10s #20 second effective update rate for Power, 40 second for Current and Voltage. Default 60s
+
+# # Reports the Current, Voltage, and Power used by the plugged-in device
+#   - platform: hlw8012
+#     model: BL0937
+#     sel_pin:
+#       number: GPIO03
+#       inverted: true
+#     cf_pin: GPIO04
+#     cf1_pin: GPIO05
+#     change_mode_every: 8
+#     update_interval: 10s
+#     current:
+#       name: ${friendly_name} Amperage
+#       icon: mdi:current-ac
+#       unit_of_measurement: A
+#     voltage:
+#       name: ${friendly_name} Voltage
+#       icon: mdi:flash-circle
+#       unit_of_measurement: V
+#     power:
+#       id: wattage
+#       name: ${friendly_name} Wattage
+#       icon: mdi:flash-outline
+#       unit_of_measurement: W
+#     current_resistor: ${current_res}
+#     voltage_divider: ${voltage_div}
+
+  - platform: mqtt_subscribe
+    name: "Data from topic"
+    id: control_mqtt
+    topic: girier/control
+
+  # Reports the total Power so-far each day, resets at midnight, see https://esphome.io/components/sensor/total_daily_energy.html
+  - platform: total_daily_energy
+    name: ${friendly_name} Total Daily Energy
+    icon: mdi:circle-slice-3
+    power_id: wattage
+    filters:
+      # Multiplication factor from W to kW is 0.001
+      - multiply: 0.001
+    unit_of_measurement: kWh
+
+binary_sensor:
+# Button on the front is pressed and then toggle relay
+  - platform: gpio
+    device_class: power
+    pin:
+      number: GPIO13
+      mode: INPUT_PULLUP
+      inverted: True
+    name: ${friendly_name} Button # Name to make button visible in HA
+    on_press:
+      - switch.toggle: relay
+
+text_sensor:
+# Reports the ESPHome Version with compile date
+  - platform: version
+    name: ${friendly_name} ESPHome Version
+
+# Reports detailed wifi info, can be commented out
+  - platform: wifi_info
+    ip_address:
+      name: ${friendly_name} IP Address
+    # ssid: # Some additional wifi info that is not normally needed
+    #   name: ${friendly_name} Connected SSID
+    # bssid:
+    #   name: ${friendly_name} Connected BSSID
+
+switch:
+# Relay itself
+  - platform: gpio
+    name: ${friendly_name}
+    pin: GPIO12
+    id: relay
+    restore_mode: RESTORE_DEFAULT_OFF #Try to restore relay state after reboot/power-loss event.
+    #RESTORE_DEFAULT_OFF (Default) - Attempt to restore state and default to OFF if not possible to restore. Uses flash write cycles.
+    #RESTORE_DEFAULT_ON - Attempt to restore state and default to ON. Uses flash write cycles.
+    #ALWAYS_OFF - Always initialize the pin as OFF on bootup. Does not use flash write cycles.
+    #ALWAYS_ON - Always initialize the pin as ON on bootup. Does not use flash write cycles.
+    on_turn_on: # Action when relay is turned on
+      - script.execute: led_relay_on
+    on_turn_off: # Action when relay is turned off
+      - script.execute: led_relay_off
+
+output:
+# Output GPIOs for blue led
+- platform: esp8266_pwm # Blue
+  id: ${devicename}_blue_output
+  pin:
+    number: GPIO01
+    inverted: True
+
+light:
+# RGB light
+- platform: monochromatic
+  name: ${friendly_name} Light
+  output: ${devicename}_blue_output
+  id: ${devicename}_blue_led
+
+# Blink the blue light if we aren't connected to WiFi. Could use https://esphome.io/components/status_led.html instead but then we couldn't use the blue light for other things as well.
+# Only if not connected after 30s
+interval:
+  - interval: 2000ms
+    then:
+      - if:
+          condition:
+            for:
+              time: 30s
+              condition:
+                not:
+                  wifi.connected:
+          then:
+            - light.turn_on:
+                id: ${devicename}_blue_led
+                brightness: 100%
+
+script:
+  - id: led_relay_off # Normal operation when relay is off
+    then:
+      - light.turn_off:
+          id: ${devicename}_blue_led
+      - mqtt.publish:
+          topic: girier/state
+          payload: "OFF"
+
+  - id: led_relay_on # Normal operation when relay is on
+    then:
+      - light.turn_on:
+          id: ${devicename}_blue_led
+          brightness: 80%
+      - mqtt.publish:
+          topic: girier/state
+          payload: "ON"
+
+
+mqtt:
+  broker: !secret mqtt_host
+  username: girier
+  password: !secret mqtt_password_waterring
+  # Optional variables:
+  discovery: true
+
+  on_message:
+    - topic: girier/relay_on
+      then:
+        - switch.turn_on: relay
+
+    - topic: girier/relay_off
+      then:
+        - switch.turn_off: relay
+
+#ESP8266 pins - SoftwareSerial
+# uart:
+#   tx_pin: 1
+#   rx_pin: 3
+#   baud_rate: 9600
